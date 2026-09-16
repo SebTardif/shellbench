@@ -301,6 +301,30 @@ def test_inspect_and_warmup_honor_subprocess_timeout(
             )
 
 
+@pytest.mark.parametrize("action", ["inspect", "warmup"])
+def test_inspect_and_warmup_accept_run_only_executor(tmp_path: Path, action: str) -> None:
+    class RunOnlyExecutor:
+        def run(self, command, *, capture_output=False):
+            assert capture_output
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="synthetic failure")
+
+    controller = object.__new__(FleetController)
+    controller.config = FleetConfig(
+        run_index=tmp_path / "index.json",
+        local_root=tmp_path,
+        runner_root=tmp_path,
+        task_archive=tmp_path / "tasks.tar",
+        env_file=tmp_path / "test.env",
+    )
+    controller.executor = RunOnlyExecutor()
+
+    with pytest.raises(FleetError, match="synthetic failure"):
+        if action == "inspect":
+            controller._inspect_lease("synthetic", required=True)
+        else:
+            controller._warmup_lease(["crabbox", "warmup"], "synthetic")
+
+
 def test_optional_inspect_treats_stopped_lease_as_absent(tmp_path: Path) -> None:
     run_index = tmp_path / "manifests" / "run_index.json"
     _write_index(run_index, [])
@@ -439,16 +463,6 @@ class FakeExecutor:
         self._next_lease = 0
         self.active_leases = 0
         self.max_active_leases = 0
-
-    def run_with_timeout(
-        self,
-        command: Sequence[str],
-        *,
-        capture_output: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        del timeout
-        return self.run(command, capture_output=capture_output)
 
     def run(
         self,
