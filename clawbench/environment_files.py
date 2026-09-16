@@ -20,7 +20,6 @@ import logging
 import os
 import re
 import signal
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -100,23 +99,39 @@ def _execution_subprocess_kwargs() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
-def _kill_execution_pgroup(process: asyncio.subprocess.Process) -> None:
+EXECUTION_CLEANUP_TIMEOUT_SECONDS = 2.0
+
+
+async def _kill_execution_pgroup(process: asyncio.subprocess.Process) -> None:
     """Signal the process group so shell-spawned children do not keep pipes open."""
     if process.pid is None:
         return
     if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-            check=False,
-            capture_output=True,
-        )
+        killer = None
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/PID", str(process.pid),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(killer.wait(), timeout=EXECUTION_CLEANUP_TIMEOUT_SECONDS)
+        except (OSError, TimeoutError):
+            pass
+        finally:
+            if killer is not None and killer.returncode is None:
+                try:
+                    killer.kill()
+                    await asyncio.wait_for(killer.wait(), timeout=EXECUTION_CLEANUP_TIMEOUT_SECONDS)
+                except (OSError, TimeoutError):
+                    pass
         try:
             process.kill()
         except ProcessLookupError:
             pass
         return
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        # start_new_session makes the spawned PID the group ID, even after it exits.
+        os.killpg(process.pid, signal.SIGKILL)
         return
     except (ProcessLookupError, PermissionError, OSError):
         pass
@@ -126,14 +141,12 @@ def _kill_execution_pgroup(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _reap_timed_out_process(
-    process: asyncio.subprocess.Process, timeout_seconds: float
-) -> None:
-    _kill_execution_pgroup(process)
+async def _reap_timed_out_process(process: asyncio.subprocess.Process) -> None:
+    await _kill_execution_pgroup(process)
     try:
         await asyncio.wait_for(
             process.communicate(),
-            timeout=max(1.0, float(timeout_seconds)),
+            timeout=EXECUTION_CLEANUP_TIMEOUT_SECONDS,
         )
     except (asyncio.TimeoutError, ProcessLookupError, OSError):
         try:
@@ -209,7 +222,7 @@ async def run_execution_check(
             timeout=spec.timeout_seconds,
         )
     except asyncio.TimeoutError:
-        await _reap_timed_out_process(process, spec.timeout_seconds)
+        await _reap_timed_out_process(process)
         return ExecutionCheckResult(
             name=spec.name,
             command=rendered_command,

@@ -170,7 +170,7 @@ async def run_execution_check(
             timeout=spec.timeout_seconds,
         )
     except asyncio.TimeoutError:
-        await _reap_timed_out_process(process, spec.timeout_seconds)
+        await _reap_timed_out_process(process)
         return ExecutionCheckResult(
             name=spec.name,
             command=rendered_command,
