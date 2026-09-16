@@ -329,7 +329,7 @@ Being honest about what reproduces and what doesn't:
 ### What drifts
 
 The native fleet controller bounds Crabbox CLI inspection to 45 seconds and
-warmup to 120 seconds per invocation. Provisioning readiness is polled separately.
+warmup to 30 minutes per invocation so Crabbox can finish provider create and readiness.
 Custom injected command executors retain their `run` interface and own their
 execution deadlines.
 

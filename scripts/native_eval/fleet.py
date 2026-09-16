@@ -58,8 +58,10 @@ CRABBOX_INSPECT_ATTEMPTS = 4
 # Coordinator inspect is a single GET. Bound it so a hung broker cannot
 # pin the fleet controller.
 CRABBOX_INSPECT_TIMEOUT_SECONDS = 45
-# Warmup is the lease create POST. Provision readiness is polled separately.
-CRABBOX_WARMUP_TIMEOUT_SECONDS = 2 * 60
+# Crabbox warmup waits for provider create plus readiness (AWS coordinator
+# polls activation inside a 30-minute creation budget). Do not treat it as
+# a single create POST.
+CRABBOX_WARMUP_TIMEOUT_SECONDS = 30 * 60
 
 
 class CommandExecutor(Protocol):

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Bound fleet lease inspection and warmup subprocesses while preserving run-only injected executors (#77, thanks @SebTardif).
+- Bound fleet lease inspection (45s) and warmup (30 minutes, Crabbox create plus readiness) while preserving run-only injected executors (#77, thanks @SebTardif).
 - Refresh bundled Chromium through Playwright 1.62.1, align the Kubernetes MLflow server with client 3.15.2, and require Pydantic 2.13.5 bug fixes.
 - Apply planned native reasoning effort to all four harnesses and resolve proxy, runner, and manifest precedence before proxy startup (#53, thanks @vincentkoc).
 - Rehydrate replacement native fleet leases instead of trusting stale bootstrap timestamps (#58, thanks @vincentkoc).
