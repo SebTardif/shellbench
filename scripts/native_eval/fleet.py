@@ -563,8 +563,9 @@ class FleetController:
             if remote_state == "missing":
                 if self._local_artifacts(run.run_label):
                     raise FleetError("local artifacts exist but the remote run state is missing")
-                if not entry.get("bootstrapped_at_utc"):
-                    self._hydrate_lease(lease)
+                current = self._store.get(run.run_label)
+                if current.get("bootstrapped_lease_id") != lease.lease_id:
+                    self._hydrate_lease(lease, run)
                 self._dispatch(lease, run)
             elif remote_state == "stale":
                 raise FleetError("remote run state is stale and cannot be overwritten")
@@ -823,7 +824,7 @@ curl -fsS --max-time 3 \
             region=region,
         )
 
-    def _hydrate_lease(self, lease: Lease) -> None:
+    def _hydrate_lease(self, lease: Lease, run: RunSpec) -> None:
         assert self.runner_archive is not None
         remote_runner_archive = f"/tmp/{lease.slug}-runner.tar.gz"
         remote_task_archive = f"/tmp/{lease.slug}-tasks.tar.gz"
@@ -856,6 +857,7 @@ source_env=$4
 runner_commit=$5
 runner_sha256=$6
 task_sha256=$7
+harness=$8
 printf '%s  %s\n' "$runner_sha256" "$runner_archive" | sha256sum -c -
 printf '%s  %s\n' "$task_sha256" "$task_archive" | sha256sum -c -
 rm -rf "$root/runner.new" "$root/public-tasks.new"
@@ -868,7 +870,7 @@ mv "$root/runner.new" "$root/runner"
 mv "$root/public-tasks.new" "$root/public-tasks"
 printf '%s\n' "$runner_commit" > "$root/runner.commit"
 rm -f "$runner_archive" "$task_archive" "$source_env"
-bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
+bash "$root/runner/scripts/native_eval/bootstrap_beast.sh" "$harness"
 """
         self._checked(
             self._ssh_command(
@@ -885,6 +887,7 @@ bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
                     self.runner_commit,
                     self.runner_archive_sha256,
                     self.task_archive_sha256,
+                    run.harness,
                 ],
             ),
             capture_output=False,
@@ -894,6 +897,7 @@ bash "$root/runner/scripts/native_eval/bootstrap_beast.sh"
             self._run_label_for_lease(lease.lease_id),
             status="ready",
             bootstrapped_at_utc=utc_now(),
+            bootstrapped_lease_id=lease.lease_id,
         )
 
     def _probe_remote(self, lease: Lease, run_label: str) -> str:
@@ -1246,16 +1250,6 @@ printf '%s\n' "$pid"
             raise FleetError(f"conflicting archived exit_status values for {run_label}")
         return candidates[0] if candidates else None
 
-    def _checkpoint_log_has_final(self, run_label: str) -> bool:
-        log_path = self.config.local_root / "logs" / f"{run_label}.checkpoints.log"
-        if not log_path.is_file():
-            return False
-        for line in log_path.read_text(encoding="utf-8").splitlines():
-            fields = line.split("\t", 4)
-            if len(fields) >= 2 and fields[1] == "final":
-                return True
-        return False
-
     def _finish_exported(self, entry: dict[str, Any], run: RunSpec) -> bool:
         verified, result_count, artifacts = self._verify_final(run.run_label)
         if not verified:
@@ -1281,19 +1275,6 @@ printf '%s\n' "$pid"
                 exit_code_changes = {
                     "run_exit_code": run_exit_code,
                     "run_exit_code_source": "archived_exit_status",
-                }
-            elif (
-                result_count == run.expected_task_count
-                and self._checkpoint_log_has_final(run.run_label)
-            ):
-                run_exit_code = 0
-                exit_code_changes = {
-                    "run_exit_code": 0,
-                    "run_exit_code_source": "recovered_full_coverage_remote_done",
-                    "run_exit_code_inference": (
-                        "inferred zero from verified full-coverage archive and "
-                        "checkpoint final event after remote done"
-                    ),
                 }
         stop_command = [
             self.config.crabbox_bin,
@@ -1498,7 +1479,10 @@ printf '%s\n' "$pid"
 
     def _run_spec(self, entry: dict[str, Any]) -> RunSpec:
         try:
-            return RunSpec(**{field: entry[field] for field in RUN_SPEC_FIELDS})
+            return RunSpec(
+                **{field: entry[field] for field in RUN_SPEC_FIELDS},
+                reasoning_effort=entry.get("reasoning_effort"),
+            )
         except KeyError as exc:
             raise FleetError(
                 f"run entry {entry.get('run_label', '<unknown>')} lacks {exc.args[0]}"

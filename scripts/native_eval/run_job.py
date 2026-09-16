@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import uuid
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from scripts.native_eval.models import (
     model_by_slug,
     trajectory_mode_for_harness,
 )
+from scripts.native_eval.proxy import REASONING_EFFORTS, write_proxy_config
 from scripts.native_eval.runtime import atomic_write_json, run_trial, utc_now
 from scripts.native_eval.tasks import TaskSpec, validate_suite
 
@@ -127,9 +129,12 @@ async def run_job(
     state["finished_at"] = utc_now()
     state["updated_at"] = state["finished_at"]
     _update_job_result(state, results, len(tasks))
+    acceptance = _execution_acceptance(results, len(tasks))
+    state["execution_acceptance"] = acceptance
     atomic_write_json(job_dir / "result.json", state)
     manifest["finished_at_utc"] = state["finished_at"]
     manifest["result_json_count"] = len(results)
+    manifest["execution_acceptance"] = acceptance
     agent_results = [
         result.get("agent_result")
         for result in results
@@ -204,6 +209,30 @@ def _update_job_result(
     state["updated_at"] = utc_now()
 
 
+def _execution_acceptance(
+    results: list[dict[str, Any]],
+    total: int,
+) -> dict[str, Any]:
+    kinds = Counter(
+        str((result.get("execution_outcome") or {}).get("kind") or "unknown")
+        for result in results
+    )
+    invalid_kinds = {"harness_error", "infra_error", "verifier_error"}
+    invalid_count = sum(kinds[kind] for kind in invalid_kinds)
+    accepted = len(results) == total and invalid_count < total
+    if len(results) != total:
+        reason = "incomplete_result_coverage"
+    elif invalid_count == total and total:
+        reason = "all_trials_harness_or_infrastructure_errors"
+    else:
+        reason = None
+    return {
+        "accepted": accepted,
+        "reason": reason,
+        "outcome_counts": dict(sorted(kinds.items())),
+    }
+
+
 def _run_manifest(
     run: RunSpec,
     *,
@@ -270,7 +299,7 @@ def _run_manifest(
             "SHELLBENCH_HARBOR_REFERENCE_COMMIT"
         ),
         "judge_model_id": os.environ.get("SHELLBENCH_JUDGE_MODEL_ID"),
-        "reasoning_effort": os.environ.get("SHELLBENCH_REASONING_EFFORT"),
+        "reasoning_effort": run.reasoning_effort,
         "judge_reasoning_effort": os.environ.get(
             "SHELLBENCH_JUDGE_REASONING_EFFORT"
         ),
@@ -293,6 +322,11 @@ def _run_manifest(
         "started_at_utc": started_at,
         "finished_at_utc": None,
         "result_json_count": 0,
+        "execution_acceptance": {
+            "accepted": None,
+            "reason": "run_in_progress",
+            "outcome_counts": {},
+        },
     }
 
 
@@ -358,6 +392,16 @@ def _runner_patch_hash() -> str:
 def build_run_spec(args: argparse.Namespace) -> RunSpec:
     harness = harness_by_name(args.harness)
     model = model_by_slug(args.model_slug)
+    cli_effort = getattr(args, "reasoning_effort", None)
+    environment_effort = os.environ.get("SHELLBENCH_REASONING_EFFORT", "").strip()
+    if cli_effort and environment_effort and cli_effort != environment_effort:
+        raise ValueError(
+            "--reasoning-effort conflicts with SHELLBENCH_REASONING_EFFORT; "
+            "resolve it with --prepare-proxy-config before starting the proxy"
+        )
+    reasoning_effort = cli_effort or environment_effort or None
+    if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError("reasoning effort must be low, medium, high, or xhigh")
     return RunSpec(
         run_label=args.run_label,
         harness=harness.name,
@@ -369,6 +413,7 @@ def build_run_spec(args: argparse.Namespace) -> RunSpec:
         repetition=args.repetition,
         expected_task_count=args.expected_task_count,
         run_date=args.run_date,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -396,6 +441,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-suite-path", required=True)
     parser.add_argument("--run-date", required=True)
     parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high", "xhigh"),
+    )
+    parser.add_argument(
+        "--prepare-proxy-config",
+        type=Path,
+        help="Resolve effort, write proxy config, print the effort, and exit before running tasks.",
+    )
+    parser.add_argument(
         "--toolchain-root",
         type=Path,
         default=Path("/opt/shellbench-native"),
@@ -417,12 +471,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Overrides are safe only while preparing a proxy that has not started yet.
+    if args.prepare_proxy_config and args.reasoning_effort:
+        os.environ["SHELLBENCH_REASONING_EFFORT"] = args.reasoning_effort
+    run = build_run_spec(args)
+    if args.prepare_proxy_config:
+        write_proxy_config(args.prepare_proxy_config)
+        print(run.reasoning_effort)
+        return
     proxy_key = os.environ.get("SHELLBENCH_PROXY_KEY", "")
     state = asyncio.run(
         run_job(
             tasks_root=args.tasks_root,
             jobs_dir=args.jobs_dir,
-            run=build_run_spec(args),
+            run=run,
             public_tasks_commit=args.public_tasks_commit,
             task_suite_path=args.task_suite_path,
             toolchain_root=args.toolchain_root,
@@ -434,6 +496,8 @@ def main() -> None:
         )
     )
     print(json.dumps(state, indent=2))
+    if state["execution_acceptance"]["accepted"] is not True:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

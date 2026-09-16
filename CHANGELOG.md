@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- Bound native Docker teardown and reap timed-out Docker CLI processes so a stalled daemon cannot hang trial cleanup (#66, thanks @SebTardif).
+- Refresh bundled Chromium through Playwright 1.62.1, align the Kubernetes MLflow server with client 3.15.2, and require Pydantic 2.13.5 bug fixes.
+- Apply planned native reasoning effort to all four harnesses and resolve proxy, runner, and manifest precedence before proxy startup (#53, thanks @vincentkoc).
+- Rehydrate replacement native fleet leases instead of trusting stale bootstrap timestamps (#58, thanks @vincentkoc).
+- Separate native execution validity from diagnostic rewards, reject wholly invalid runs, and preserve terminal exit status in recovery archives (#63, thanks @vincentkoc).
+- Install only the assigned native harness on each fleet lease and record only its version in the toolchain manifest (#65).
+- Refresh Python runtime, MLflow, lint, and HF mirror dependencies, including websockets 17 with a real gateway socket regression test, while preserving Python 3.11 NumPy support.
 - Record and enforce GPT reasoning effort in native runs, preserve it across
   reruns, and stabilize OpenClaw and Hermes trace completion.
 - Export OpenClaw and Hermes sessions reliably and convert their native traces
