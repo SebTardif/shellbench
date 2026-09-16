@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import tarfile
 import threading
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
 
 import pytest
 
@@ -21,6 +24,10 @@ from scripts.native_eval.fleet import (
     parse_args,
 )
 from scripts.native_eval.models import RunSpec
+
+
+# Bound deadlocks, not scheduler latency; only the tests release blocked jobs.
+SCHEDULER_TEST_TIMEOUT = 30
 
 
 def _run_spec(
@@ -78,6 +85,84 @@ def _planned(run: RunSpec) -> dict[str, object]:
         "lease": None,
         "artifacts": [],
     }
+
+
+@pytest.mark.parametrize("exit_code", [0, 2])
+def test_remote_run_archives_terminal_status(tmp_path: Path, exit_code: int) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    if subprocess.run(
+        [
+            bash, "-c",
+            "(( BASH_VERSINFO[0] > 4 || "
+            "(BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) ))",
+        ],
+        check=False,
+    ).returncode:
+        pytest.skip("remote_run.sh requires modern Bash")
+    label = f"shellbench-test-{uuid4().hex}"
+    root = tmp_path / "remote"
+    (root / "runner").mkdir(parents=True)
+    toolchain = tmp_path / "toolchain"
+    proxy = toolchain / "litellm-venv" / "bin" / "litellm"
+    proxy.parent.mkdir(parents=True)
+    proxy.write_text("#!/bin/sh\nexec sleep 60\n", encoding="utf-8")
+    proxy.chmod(0o755)
+    env_file = tmp_path / "remote.env"
+    env_file.write_text("", encoding="utf-8")
+    shell_env = tmp_path / "bash_env"
+    shell_env.write_text(
+        '''python3() {
+  if [[ "$*" == *--prepare-proxy-config* ]]; then printf 'high\\n'; return 0; fi
+  mkdir -p "$TEST_ROOT/results/jobs/$TEST_LABEL/task__trial"
+  printf '{}\\n' > "$TEST_ROOT/results/jobs/$TEST_LABEL/task__trial/result.json"
+  printf '{}\\n' > "$TEST_ROOT/results/jobs/$TEST_LABEL/run_manifest.json"
+  return "$TEST_EXIT_CODE"
+}
+curl() { return 0; }
+sudo() { "$@"; }
+''',
+        encoding="utf-8",
+    )
+    archive = Path("/tmp") / f"{label}-final-artifacts.tar.gz"
+    state_dir = Path("/tmp/shellbench-runs") / label
+    metadata_dir = Path("/tmp") / f"shellbench_meta-{label}"
+    script = Path(__file__).resolve().parents[1] / "scripts/native_eval/remote_run.sh"
+    try:
+        process = subprocess.run(
+            [
+                bash, str(script), str(root), str(tmp_path), str(env_file),
+                label, "openclaw", "gpt55", "1", "1", "tasks-commit",
+                "20260828", "1", "test", "gpt-5.5", "openai", "sb-gpt55", "",
+            ],
+            env={
+                **os.environ,
+                "BASH_ENV": str(shell_env),
+                "TOOLCHAIN_ROOT": str(toolchain),
+                "SHELLBENCH_PROXY_KEY": "synthetic-test-key",
+                "TEST_ROOT": str(root),
+                "TEST_LABEL": label,
+                "TEST_EXIT_CODE": str(exit_code),
+            },
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        assert process.returncode == exit_code, process.stderr
+        assert state_dir.joinpath("exit_status").read_text().strip() == str(exit_code)
+        config = _config(tmp_path, tmp_path / "run_index.json")
+        raw = config.local_root / "raw"
+        raw.mkdir(parents=True)
+        shutil.copyfile(archive, raw / archive.name)
+        controller = FleetController(
+            config, executor=FakeExecutor(config.local_root, expected_counts={label: 1})
+        )
+        assert controller._archived_exit_status(label) == exit_code
+    finally:
+        archive.unlink(missing_ok=True)
+        shutil.rmtree(state_dir, ignore_errors=True)
+        shutil.rmtree(metadata_dir, ignore_errors=True)
 
 
 def test_provisioning_lease_is_not_ready_before_ssh_details_exist() -> None:
@@ -564,6 +649,25 @@ def test_controller_runs_bounded_wave_and_stops_after_verified_export(
     assert "TOPSECRET" not in "\n".join(" ".join(command) for command in executor.commands)
 
 
+@pytest.mark.parametrize("harness", ["openclaw", "codex", "claude-code", "hermes"])
+def test_controller_hydrates_selected_harness(tmp_path: Path, harness: str) -> None:
+    label = f"{harness}-gpt55-full-2-r1-20260727"
+    entry = {**_planned(_run_spec(label)), "harness": harness}
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [entry])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    hydration = next(
+        shlex.split(command[-1]) for command in executor.commands
+        if command[0] == "ssh" and "fleet-hydrate" in command[-1]
+    )
+    assert hydration[-1] == harness
+    assert 'bootstrap_beast.sh" "$harness"' in hydration[2]
+
+
 def test_controller_dispatches_only_matching_parity_scope(tmp_path: Path) -> None:
     label = "openclaw-gpt55-full-2-r1-20260727"
     run_index = tmp_path / "manifests" / "run_index.json"
@@ -967,12 +1071,12 @@ def test_slow_capped_model_does_not_block_refilling_eligible_slot(
     )
     controller.start()
     try:
-        assert executor.wait_for_dispatch(later_gpt, timeout=2)
+        assert executor.wait_for_dispatch(later_gpt, timeout=SCHEDULER_TEST_TIMEOUT)
         assert capped_fable not in executor.dispatches
         assert not release_slow.is_set()
     finally:
         release_slow.set()
-        controller.join(timeout=5)
+        controller.join(timeout=SCHEDULER_TEST_TIMEOUT)
 
     assert not controller.is_alive()
     assert result == [0]
@@ -1043,7 +1147,9 @@ def test_recovery_pending_entries_respect_capacity_behind_owned_runs(
     )
     controller.start()
     try:
-        assert executor.wait_for_dispatch(pending_labels[0], timeout=2)
+        assert executor.wait_for_dispatch(
+            pending_labels[0], timeout=SCHEDULER_TEST_TIMEOUT
+        )
         assert executor.dispatches == [pending_labels[0]]
         index = json.loads(run_index.read_text(encoding="utf-8"))
         pending_statuses = {
@@ -1055,7 +1161,7 @@ def test_recovery_pending_entries_respect_capacity_behind_owned_runs(
         assert executor.active_leases == 10
     finally:
         release_runs.set()
-        controller.join(timeout=10)
+        controller.join(timeout=SCHEDULER_TEST_TIMEOUT)
 
     assert not controller.is_alive()
     assert result == [0]
@@ -1273,7 +1379,87 @@ def test_recovery_required_resumes_existing_remote_run(tmp_path: Path) -> None:
     assert final["status"] == "completed"
 
 
-def test_recovery_infers_success_from_verified_full_archive_and_done_log(
+@pytest.mark.parametrize("bootstrap_id,remote_state,hydrations", [
+    (None, "missing", 1),
+    ("cbx_old", "missing", 1),
+    ("cbx_1", "missing", 0),
+    (None, "running", 0),
+])
+def test_recovery_binds_bootstrap_to_lease_identity(
+    tmp_path: Path,
+    bootstrap_id: str | None,
+    remote_state: str,
+    hydrations: int,
+) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = _planned(_run_spec(label))
+    run.update(
+        {
+            "status": "recovery_required",
+            "requested_lease_slug": "replacement",
+            "bootstrapped_at_utc": "2026-07-27T00:00:00Z",
+        }
+    )
+    if bootstrap_id is not None:
+        run["bootstrapped_lease_id"] = bootstrap_id
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+    executor = FakeExecutor(config.local_root, expected_counts={label: 2})
+    executor.remote_states[label] = remote_state
+
+    assert FleetController(config, executor=executor).run() == 0
+
+    final = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
+    assert final["status"] == "completed"
+    assert final.get("bootstrapped_lease_id") == ("cbx_1" if hydrations else bootstrap_id)
+    assert sum(
+        command and command[0] == "ssh" and "fleet-hydrate" in " ".join(command)
+        for command in executor.commands
+    ) == hydrations
+    assert executor.dispatches == ([label] if remote_state == "missing" else [])
+    if not hydrations:
+        assert final["bootstrapped_at_utc"] == "2026-07-27T00:00:00Z"
+
+
+def test_recovery_retries_failed_hydration_before_binding_lease(tmp_path: Path) -> None:
+    label = "openclaw-gpt55-full-2-r1-20260727"
+    run = {
+        **_planned(_run_spec(label)),
+        "status": "recovery_required",
+        "requested_lease_slug": "replacement",
+        "bootstrapped_at_utc": "2026-07-27T00:00:00Z",
+    }
+    run_index = tmp_path / "manifests" / "run_index.json"
+    _write_index(run_index, [run])
+    config = _config(tmp_path, run_index)
+
+    class HydrationFailureExecutor(FakeExecutor):
+        attempts = 0
+
+        def run(self, command, *, capture_output=False):
+            result = super().run(command, capture_output=capture_output)
+            if command[0] == "ssh" and "fleet-hydrate" in " ".join(command):
+                self.attempts += 1
+                if self.attempts == 1:
+                    return _result(command, 1, stderr="bootstrap failed")
+            return result
+
+    executor = HydrationFailureExecutor(config.local_root, expected_counts={label: 2})
+    assert FleetController(config, executor=executor).run() == 1
+    failed = json.loads(run_index.read_text())["runs"][0]
+    assert failed["status"] == "recovery_required"
+    assert "bootstrapped_lease_id" not in failed
+    assert executor.dispatches == []
+
+    assert FleetController(config, executor=executor).run() == 0
+    recovered = json.loads(run_index.read_text())["runs"][0]
+    assert recovered["bootstrapped_lease_id"] == "cbx_1"
+    assert executor.attempts == 2
+    assert executor.dispatches == [label]
+
+
+def test_recovery_does_not_infer_success_from_result_count(
     tmp_path: Path,
 ) -> None:
     label = "openclaw-gpt55-full-2-r1-20260727"
@@ -1287,7 +1473,7 @@ def test_recovery_infers_success_from_verified_full_archive_and_done_log(
     }
     run_index = tmp_path / "manifests" / "run_index.json"
     _write_index(run_index, [run])
-    config = _config(tmp_path, run_index)
+    config = _config(tmp_path, run_index, max_attempts=1)
     _write_final(config.local_root, label, 2)
     checkpoint_log = config.local_root / "logs" / f"{label}.checkpoints.log"
     checkpoint_log.parent.mkdir(parents=True, exist_ok=True)
@@ -1309,16 +1495,16 @@ def test_recovery_infers_success_from_verified_full_archive_and_done_log(
     }
     executor.active_leases = 1
 
-    assert FleetController(config, executor=executor).run() == 0
+    assert FleetController(config, executor=executor).run() == 1
 
     recovered = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
-    assert recovered["status"] == "completed"
-    assert recovered["run_exit_code"] == 0
-    assert recovered["run_exit_code_source"] == "recovered_full_coverage_remote_done"
-    assert "inferred zero" in recovered["run_exit_code_inference"]
+    assert recovered["status"] == "failed"
+    assert recovered.get("run_exit_code") is None
+    assert recovered["last_error"] == "run exit unknown; result coverage 2/2"
 
 
-def test_recovery_preserves_archived_nonzero_exit_status(tmp_path: Path) -> None:
+@pytest.mark.parametrize("exit_code", [0, 2, 7])
+def test_recovery_preserves_archived_exit_status(tmp_path: Path, exit_code: int) -> None:
     label = "openclaw-gpt55-full-2-r1-20260727"
     run = _planned(_run_spec(label))
     run["status"] = "recovery_required"
@@ -1331,17 +1517,19 @@ def test_recovery_preserves_archived_nonzero_exit_status(tmp_path: Path) -> None
     run_index = tmp_path / "manifests" / "run_index.json"
     _write_index(run_index, [run])
     config = _config(tmp_path, run_index, max_attempts=1)
-    _write_final(config.local_root, label, 2, exit_status=7)
+    _write_final(config.local_root, label, 2, exit_status=exit_code)
     executor = FakeExecutor(config.local_root, expected_counts={label: 2})
     executor.active_leases = 1
 
-    assert FleetController(config, executor=executor).run() == 1
+    assert FleetController(config, executor=executor).run() == int(exit_code != 0)
 
     recovered = json.loads(run_index.read_text(encoding="utf-8"))["runs"][0]
-    assert recovered["status"] == "failed"
-    assert recovered["run_exit_code"] == 7
+    assert recovered["status"] == ("completed" if exit_code == 0 else "failed")
+    assert recovered["run_exit_code"] == exit_code
     assert recovered["run_exit_code_source"] == "archived_exit_status"
-    assert recovered["last_error"] == "run exit 7; result coverage 2/2"
+    assert recovered["last_error"] == (
+        None if exit_code == 0 else f"run exit {exit_code}; result coverage 2/2"
+    )
 
 
 def test_stop_failure_is_left_pending_without_tight_retry(tmp_path: Path) -> None:

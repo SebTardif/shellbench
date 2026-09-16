@@ -10,6 +10,8 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.native_eval.checkpoint_loop import (
     count_result_json,
     next_checkpoint_sequence,
@@ -34,6 +36,7 @@ from scripts.native_eval.models import (
 from scripts.native_eval import plan as native_plan
 from scripts.native_eval.proxy import JUDGE_PROXY_MODEL_NAME, write_proxy_config
 from scripts.native_eval.run_job import (
+    _execution_acceptance,
     _git_commit,
     _run_manifest,
     build_run_spec,
@@ -41,8 +44,10 @@ from scripts.native_eval.run_job import (
 )
 from scripts.native_eval.runtime import (
     DockerTaskEnvironment,
+    NonZeroAgentExitCodeError,
     build_judge_env,
     collect_agent_metrics,
+    execution_outcome,
     read_reward,
     write_agent_trajectory,
 )
@@ -58,6 +63,111 @@ def test_matrix_plan_contains_only_requested_models_and_harnesses() -> None:
     assert {run.harness for run in plan} == {harness.name for harness in HARNESSES}
     assert {run.model_slug for run in plan} == {model.slug for model in MODELS}
     assert {run.repetition for run in plan} == {1, 2, 3}
+
+
+def test_openclaw_terminal_evidence_exit_is_a_harness_error() -> None:
+    outcome = execution_outcome(
+        harness="openclaw",
+        exception=NonZeroAgentExitCodeError("Agent exited with code 71"),
+        agent_exit_code=71,
+    )
+
+    assert outcome == {
+        "kind": "harness_error",
+        "exit_code": 71,
+        "reason": "terminal_session_evidence_unavailable",
+    }
+
+
+def test_all_harness_errors_reject_run_but_agent_errors_do_not() -> None:
+    rejected = _execution_acceptance(
+        [
+            {"execution_outcome": {"kind": "harness_error"}},
+            {"execution_outcome": {"kind": "infra_error"}},
+        ],
+        2,
+    )
+    accepted = _execution_acceptance(
+        [
+            {"execution_outcome": {"kind": "clean"}},
+            {"execution_outcome": {"kind": "agent_error"}},
+        ],
+        2,
+    )
+
+    assert rejected == {
+        "accepted": False,
+        "reason": "all_trials_harness_or_infrastructure_errors",
+        "outcome_counts": {"harness_error": 1, "infra_error": 1},
+    }
+    assert accepted == {
+        "accepted": True,
+        "reason": None,
+        "outcome_counts": {"agent_error": 1, "clean": 1},
+    }
+
+
+@pytest.mark.parametrize("failure_stage", ["reward", "artifacts", "stop", None])
+def test_trial_does_not_hide_execution_failure_after_agent_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str | None
+) -> None:
+    class Environment:
+        def __init__(self, *, trial_dir: Path, **_kwargs: object) -> None:
+            self.trial_dir = trial_dir
+
+        async def start(self):
+            return native_runtime.CommandResult(0, "start", "end")
+
+        async def copy_instruction(self, _instruction: str) -> None:
+            pass
+
+        async def exec(self, command: str, **_kwargs: object):
+            if command.endswith("/tests/test.sh") and failure_stage != "reward":
+                (self.trial_dir / "verifier" / "reward.txt").write_text("0.5")
+            return native_runtime.CommandResult(int(command == "run"), "start", "end")
+
+        async def collect_artifacts(self) -> None:
+            if failure_stage == "artifacts":
+                raise native_runtime.DockerStartupError("artifact collection failed")
+
+        async def install_tests(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            if failure_stage == "stop":
+                raise native_runtime.DockerStartupError("container cleanup failed")
+
+    monkeypatch.setattr(native_runtime, "DockerTaskEnvironment", Environment)
+    monkeypatch.setattr(
+        native_runtime,
+        "build_harness_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            setup_command="setup", run_command="run", cleanup_command="cleanup", env={}
+        ),
+    )
+    run = RunSpec(
+        run_label="trial-validity", harness="openclaw", harness_version="test",
+        model_slug="gpt55", model_id="gpt-5.5", provider="openai",
+        proxy_model_name="sb-gpt55", repetition=1, expected_task_count=1,
+        run_date="20260828",
+    )
+    result = asyncio.run(
+        native_runtime.run_trial(
+            _trajectory_task(tmp_path, "do the task"), run,
+            job_dir=tmp_path / "job", toolchain_root=tmp_path,
+            proxy_url="http://localhost:4000", proxy_key="synthetic-test-key",
+        )
+    )
+
+    assert result["exception_info"]["exception_type"] == "NonZeroAgentExitCodeError"
+    expected_kind = (
+        "verifier_error" if failure_stage == "reward"
+        else "infra_error" if failure_stage else "agent_error"
+    )
+    assert result["execution_outcome"]["kind"] == expected_kind
+    assert _execution_acceptance([result], 1)["accepted"] is (failure_stage is None)
+    if failure_stage in {None, "stop"}:
+        assert result["verifier_result"]["rewards"] == {"reward": 0.5}
 
 
 def test_run_index_records_agent_and_judge_reasoning(
@@ -386,6 +496,7 @@ def test_run_manifest_records_native_audit_metadata(
         repetition=1,
         expected_task_count=2,
         run_date="20260727",
+        reasoning_effort="high",
     )
 
     manifest = _run_manifest(
@@ -678,6 +789,96 @@ def test_harness_commands_preserve_canonical_model_identity() -> None:
         if harness.name == "codex":
             assert "2>/logs/agent/codex-stderr.txt" in command.run_command
             assert "cat /logs/agent/codex-stderr.txt >&2" in command.run_command
+
+
+@pytest.mark.parametrize("effort", ("low", "medium", "high", "xhigh"))
+@pytest.mark.parametrize("harness", ("openclaw", "hermes", "codex", "claude-code"))
+def test_harness_commands_apply_native_reasoning_effort(
+    harness: str,
+    effort: str,
+) -> None:
+    run = RunSpec(
+        run_label=f"{harness}-{effort}",
+        harness=harness,
+        harness_version="test",
+        model_slug="gpt56-sol",
+        model_id="gpt-5.6-sol",
+        provider="openai",
+        proxy_model_name="gpt-5.6-sol",
+        repetition=1,
+        expected_task_count=116,
+        run_date="20260729",
+        reasoning_effort=effort,
+    )
+
+    command = build_harness_command(
+        run,
+        proxy_url="http://host.docker.internal:4000",
+        proxy_key="local-proxy-key",
+        mcp_servers=(),
+    )
+
+    if harness == "openclaw":
+        assert f"--thinking {effort}" in command.run_command
+    elif harness == "hermes":
+        assert f'"reasoning_effort":"{effort}"' in command.setup_command
+    elif harness == "codex":
+        assert f'model_reasoning_effort="{effort}"' in command.run_command
+    else:
+        expected_effort = "max" if effort == "xhigh" else effort
+        assert f"--effort {expected_effort}" in command.run_command
+
+
+def test_harness_commands_preserve_defaults_without_reasoning_effort() -> None:
+    commands = {}
+    for harness in ("openclaw", "hermes", "codex", "claude-code"):
+        run = RunSpec(
+            run_label=f"{harness}-default",
+            harness=harness,
+            harness_version="test",
+            model_slug="gpt55",
+            model_id="gpt-5.5",
+            provider="openai",
+            proxy_model_name="gpt-5.5",
+            repetition=1,
+            expected_task_count=116,
+            run_date="20260729",
+        )
+        commands[harness] = build_harness_command(
+            run,
+            proxy_url="http://host.docker.internal:4000",
+            proxy_key="local-proxy-key",
+            mcp_servers=(),
+        )
+
+    assert "--thinking off" in commands["openclaw"].run_command
+    assert '"reasoning_effort"' not in commands["hermes"].setup_command
+    assert "model_reasoning_effort" not in commands["codex"].run_command
+    assert "--effort" not in commands["claude-code"].run_command
+
+
+def test_build_run_spec_records_reasoning_effort_from_environment(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SHELLBENCH_REASONING_EFFORT", "xhigh")
+
+    run = build_run_spec(
+        Namespace(
+            run_label="openclaw-gpt56-sol-xhigh",
+            harness="openclaw",
+            harness_version="test",
+            model_slug="gpt56-sol",
+            model_id=None,
+            model_provider=None,
+            proxy_model_name=None,
+            repetition=1,
+            expected_task_count=116,
+            run_date="20260729",
+            reasoning_effort=None,
+        )
+    )
+
+    assert run.reasoning_effort == "xhigh"
 
 
 def test_openclaw_completion_probe_accepts_markerless_final_envelope(
@@ -1261,10 +1462,15 @@ def test_workdir_falls_back_to_existing_container_directory(
     )
 
 
-def test_prepare_trial_dirs_are_owner_writable_only(tmp_path: Path) -> None:
+@pytest.mark.parametrize("existing", [False, True])
+def test_prepare_trial_dirs_keep_mounts_writable_under_private_parent(tmp_path: Path, existing: bool) -> None:
+    trial_dir = tmp_path / "trial"
+    if existing:
+        trial_dir.mkdir()
+        trial_dir.chmod(0o777)
     environment = DockerTaskEnvironment(
         task=object(),  # type: ignore[arg-type]
-        trial_dir=tmp_path,
+        trial_dir=trial_dir,
         container_name="trial",
         project_name="trial",
         toolchain_root=tmp_path,
@@ -1272,13 +1478,14 @@ def test_prepare_trial_dirs_are_owner_writable_only(tmp_path: Path) -> None:
 
     environment.prepare_trial_dirs()
 
+    assert stat.S_IMODE(trial_dir.stat().st_mode) == 0o700
     for path in (
         environment.agent_dir,
         environment.verifier_dir,
         environment.artifacts_dir / "logs" / "artifacts",
     ):
         assert path.is_dir()
-        assert stat.S_IMODE(path.stat().st_mode) == 0o755
+        assert stat.S_IMODE(path.stat().st_mode) == 0o777
 
 
 def test_claude_code_selects_canonical_model_explicitly() -> None:
