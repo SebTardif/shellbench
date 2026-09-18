@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -507,5 +508,52 @@ def test_run_lane_prepare_hook_kills_hung_hook(tmp_path: Path, monkeypatch):
         if pid_path.is_file():
             try:
                 os.kill(int(pid_path.read_text(encoding="utf-8").strip()), signal.SIGKILL)
+            except (ValueError, ProcessLookupError, OSError):
+                pass
+
+
+def test_run_lane_prepare_hook_kills_shell_child(tmp_path: Path, monkeypatch):
+    hook = tmp_path / "parent-hook"
+    hook.write_text(
+        '#!/bin/sh\n'
+        '(\n'
+        '  echo $$ > "$HOME/child.pid"\n'
+        '  sleep 2\n'
+        '  echo lived > "$HOME/child-lived"\n'
+        ') &\n'
+        'wait\n',
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    state_dir = tmp_path / "lane" / "state"
+    state_dir.mkdir(parents=True)
+    home_dir = state_dir.parent / "home"
+    home_dir.mkdir(parents=True)
+    child_pid_path = home_dir / "child.pid"
+    marker_path = home_dir / "child-lived"
+
+    monkeypatch.setenv("CLAWBENCH_LANE_PREPARE_CMD", str(hook))
+    monkeypatch.setenv("CLAWBENCH_LANE_PREPARE_TIMEOUT_SECONDS", "1")
+
+    worker = EvalWorker(JobQueue())
+    lane = ParallelLane(index=0, tasks=[DummyTask("t1", "tier1", "coding")])
+    lane.state_dir = state_dir
+    lane.port = GATEWAY_PORT
+
+    try:
+        with pytest.raises(RuntimeError, match="timed out"):
+            worker._run_lane_prepare_hook(lane)
+
+        time.sleep(2.2)
+        assert not marker_path.is_file(), "prepare-hook child survived timeout"
+        if child_pid_path.is_file():
+            pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+    finally:
+        if child_pid_path.is_file():
+            try:
+                os.kill(int(child_pid_path.read_text(encoding="utf-8").strip()), signal.SIGKILL)
             except (ValueError, ProcessLookupError, OSError):
                 pass
