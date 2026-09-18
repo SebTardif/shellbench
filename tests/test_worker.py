@@ -515,13 +515,13 @@ def test_run_lane_prepare_hook_kills_hung_hook(tmp_path: Path, monkeypatch):
 def test_run_lane_prepare_hook_kills_shell_child(tmp_path: Path, monkeypatch):
     hook = tmp_path / "parent-hook"
     hook.write_text(
-        '#!/bin/sh\n'
-        '(\n'
+        "#!/bin/sh\n"
+        "(\n"
         '  echo $$ > "$HOME/child.pid"\n'
-        '  sleep 2\n'
+        "  sleep 2\n"
         '  echo lived > "$HOME/child-lived"\n'
-        ') &\n'
-        'wait\n',
+        ") &\n"
+        "wait\n",
         encoding="utf-8",
     )
     hook.chmod(0o755)
