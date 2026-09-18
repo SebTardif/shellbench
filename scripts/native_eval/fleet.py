@@ -60,8 +60,12 @@ CRABBOX_INSPECT_ATTEMPTS = 4
 CRABBOX_INSPECT_TIMEOUT_SECONDS = 45
 # Crabbox warmup waits for provider create plus readiness (AWS coordinator
 # polls activation inside a 30-minute creation budget). Do not treat it as
-# a single create POST.
-CRABBOX_WARMUP_TIMEOUT_SECONDS = 30 * 60
+# a single create POST. After that inner deadline Crabbox still needs time
+# to abandon the unrecovered create (10s cancel plus extra). Match the
+# existing stop/release path (five 60-second release retries) so a create
+# that hits coordinatorHTTPTimeout can still record cancellation.
+CRABBOX_WARMUP_CLEANUP_SECONDS = CRABBOX_STOP_TIMEOUT_SECONDS
+CRABBOX_WARMUP_TIMEOUT_SECONDS = 30 * 60 + CRABBOX_WARMUP_CLEANUP_SECONDS
 
 
 class CommandExecutor(Protocol):
